@@ -20,5 +20,3 @@ while : ;do
     fi
     sleep 3
 done
-
-sdfsdf
