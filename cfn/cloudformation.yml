@@ -1,0 +1,288 @@
+Parameters:
+  VpcId:
+    Description: Your VPC ID
+    Type: String
+    Default: vpc-0e7c4733d5fdbaa14
+
+  VpcCidr: 
+    Description: The VPC cidr Block
+    Type: String
+    Default: 172.32.0.0/20
+  
+  PrivateSubnetRouteTableA: 
+    Description: The Route table ID for the Private Subnet in AZ a. NAT Instance will add a route to itself in this route table.
+    Type: String
+    Default: rtb-0e39060c45e2836d4
+
+  PrivateSubnetRouteTableB: 
+    Description: The Route table ID for the Private Subnet in AZ b. NAT Instance will add a route to itself in this route table.
+    Type: String
+    Default: rtb-040d6c5f587dfe962
+
+  PrivateSubnetRouteTableC: 
+    Description: The Route table ID for the Private Subnet in AZ c. NAT Instance will add a route to itself in this route table.
+    Type: String
+    Default: rtb-055f855888759281f
+
+  PublicSubnetIdA:
+    Description: The Public Subnet ID in AZ a. Will Launch NAT instance in this subnet.
+    Type: String
+    Default: subnet-0e436260afb0d64a9
+
+  PublicSubnetIdB:
+    Description: The Public Subnet ID in AZ b. Will Launch NAT instance in this subnet.
+    Type: String
+    Default: subnet-0f7ecb884c19e6558
+
+  PublicSubnetIdC:
+    Description: The Public Subnet ID in AZ c. Will Launch NAT instance in this subnet.
+    Type: String
+    Default: subnet-09d8f48f7d77b4359
+
+  NatInstanceType:
+    Description: NAT instance type 
+    Type: String
+    Default: t3.medium
+
+  NumberOfPings:
+    Description: The number of pings the failover will do before timing out
+    Type: String
+    Default: 1
+
+  PingTimeout:
+    Description: "How long the timeout should be for each ping. Example: If PingTimeout = 3 and NumberOfPings = 2 the script will timeout after it has sent 2 pings and each ping timed out after 3 seconds. A total of 6 seconds."
+    Type: String
+    Default: 3
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+Resources:
+  NATInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+      - PolicyName: NatInstance
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - autoscaling:DescribeAutoScalingInstances
+            - autoscaling:DescribeAutoScalingGroups
+            - ec2:DescribeRouteTables
+            - ec2:ModifyInstanceAttribute
+            - ec2:AssociateAddress
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - ec2:ReplaceRoute
+            - ec2:CreateRoute
+            Resource: 
+            - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:route-table/${PrivateSubnetRouteTableA}
+            - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:route-table/${PrivateSubnetRouteTableB}
+            - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:route-table/${PrivateSubnetRouteTableC}
+          - Effect: Allow
+            Action:
+            - autoscaling:SetInstanceHealth
+            - ec2:CreateTags
+            Resource: '*'
+            Condition:
+              StringEquals:
+                autoscaling:ResourceTag/NetworkService: NAT
+
+  NATInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+      - !Ref NATInstanceRole
+
+  NATInstanceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allows HTTP and HTTPS from private instances to NAT instances
+      SecurityGroupIngress:
+      - CidrIp: !Sub ${VpcCidr}
+        IpProtocol: "-1"
+      SecurityGroupEgress:
+      - CidrIp: 0.0.0.0/0
+        IpProtocol: "-1"
+      Tags:
+      - Key: Name
+        Value: 'NAT Instance SG'
+      VpcId: !Ref VpcId
+
+  NATInstanceLC:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      IamInstanceProfile: !Ref NATInstanceProfile
+      InstanceType: !Ref NatInstanceType
+      ImageId: !Ref LatestAmiId
+      SecurityGroups:
+      - !Ref NATInstanceSG
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash -xe
+            REGION=${AWS::Region}
+            INSTANCEID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            aws ec2 modify-instance-attribute --no-source-dest-check --instance-id $INSTANCEID --region $REGION &
+            iptables -t nat -A POSTROUTING -o eth0 -s ${VpcCidr} -j MASQUERADE &
+            ASG=$(aws autoscaling describe-auto-scaling-instances --instance-id $INSTANCEID --query 'AutoScalingInstances[].AutoScalingGroupName' --output text --region $REGION)
+            ROUTETABLE=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names $ASG --query 'AutoScalingGroups[].Tags[?Key == `RouteTableId`].Value[]' --output text --region $REGION)
+            EIP=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names $ASG --query 'AutoScalingGroups[].Tags[?Key == `ElasticIp`].Value[]' --output text --region $REGION)
+
+            mkdir /opt/networking/
+            cat > /opt/networking/nat-failover.sh << 'EOF'
+            #!/bin/bash -x
+            REGION="$1"
+            INSTANCEID="$2"
+            ROUTETABLEID="$3"
+            EIP="$4"
+            NUMBEROFPINGS="$5"
+            PINGTIMEOUT="$6"
+
+
+            while : ;do
+                ACTIVEINSTANCEID=$(aws ec2 describe-route-tables --route-table-id "$ROUTETABLEID" --query 'RouteTables[*].Routes[?DestinationCidrBlock == `0.0.0.0/0`].InstanceId[]' --output text --region "$REGION")
+
+                if [ "$INSTANCEID" = "$ACTIVEINSTANCEID" ]; then
+                    echo "I'm the active NAT instance. Exit"
+                else
+                    ACTIVEINSTANCEIP=$(aws ec2 describe-instances --instance-id "$ACTIVEINSTANCEID" --query 'Reservations[*].Instances[*].PrivateIpAddress[]' --output text --region "$REGION")
+
+                    while ping -c "$NUMBEROFPINGS" -w "$PINGTIMEOUT" "$ACTIVEINSTANCEIP" &>/dev/null; do
+                        echo "Successfully pinged $ACTIVEINSTANCEID on $ACTIVEINSTANCEIP"
+                        sleep 1
+                    done
+                    echo "Failed to ping $ACTIVEINSTANCEID on $ACTIVEINSTANCEIP. Will failover to this instance now!"
+                    aws ec2 associate-address --allocation-id "$EIP" --instance-id "$INSTANCEID" --allow-reassociation --region "$REGION" & aws ec2 replace-route --route-table-id "$ROUTETABLEID" --instance-id "$INSTANCEID" --destination-cidr-block 0.0.0.0/0 --region "$REGION" || aws ec2 create-route --route-table-id "$ROUTETABLEID" --instance-id "$INSTANCEID" --destination-cidr-block 0.0.0.0/0 --region "$REGION"
+                    aws ec2 create-tags --resource "$INSTANCEID" --tags 'Key=NatInstanceActive,Value=True'
+                fi 
+                sleep 3
+            done
+            EOF
+            chmod +x /opt/networking/nat-failover.sh
+
+            cat > /etc/systemd/system/nat-failover.service << 'EOF'
+            [Unit]
+            Description=Description of this service
+
+            [Service]
+            Type=simple
+            ExecStart=/opt/networking/nat-failover.sh
+            
+            #Will restart the service if it stops, except if there are more than 3 restarts in 110 seconds: in that case it will shutdown.
+            Restart=always
+            RestartSec=30
+            StartLimitIntervalSec=100
+            StartLimitBurst=3
+            StartLimitAction=poweroff-force
+
+            StandardOutput=syslog
+            StandardError=syslog
+            SyslogIdentifier=nat-failover
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl enable nat-failover.service
+            systemctl start nat-failover.service
+
+
+
+  NATInstanceASG1a:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: "2"
+      HealthCheckGracePeriod: 300
+      HealthCheckType: EC2
+      LaunchConfigurationName: !Ref NATInstanceLC
+      MaxSize: "2"
+      MinSize: "2"
+      Tags:
+      - Key: Name
+        Value: 'NAT Instance AZ a'
+        PropagateAtLaunch: True
+      - Key: NatInstanceActive
+        Value: "False"
+        PropagateAtLaunch: True
+      - Key: RouteTableId
+        Value: !Ref PrivateSubnetRouteTableA
+        PropagateAtLaunch: True
+      - Key: ElasticIp
+        Value: !Ref ElasticIpA
+        PropagateAtLaunch: True        
+      - Key: NetworkService
+        Value: "NAT"
+        PropagateAtLaunch: True
+      VPCZoneIdentifier:
+      - !Ref PublicSubnetIdA
+
+  NATInstanceASG1b:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: "2"
+      HealthCheckGracePeriod: 300
+      HealthCheckType: EC2
+      LaunchConfigurationName: !Ref NATInstanceLC
+      MaxSize: "2"
+      MinSize: "2"
+      Tags:
+      - Key: Name
+        Value: 'NAT Instance AZ b'
+        PropagateAtLaunch: True
+      - Key: NatInstanceActive
+        Value: "False"
+        PropagateAtLaunch: True
+      - Key: RouteTableId
+        Value: !Ref PrivateSubnetRouteTableB
+        PropagateAtLaunch: True
+      - Key: ElasticIp
+        Value: !Ref ElasticIpB
+        PropagateAtLaunch: True
+      - Key: NetworkService
+        Value: "NAT"
+        PropagateAtLaunch: True
+      VPCZoneIdentifier:
+      - !Ref PublicSubnetIdB
+
+  NATInstanceASG1c:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: "2"
+      HealthCheckGracePeriod: 300
+      HealthCheckType: EC2
+      LaunchConfigurationName: !Ref NATInstanceLC
+      MaxSize: "2"
+      MinSize: "2"
+      Tags:
+      - Key: Name
+        Value: 'NAT Instance AZ c'
+        PropagateAtLaunch: True
+      - Key: NatInstanceActive
+        Value: "False"
+        PropagateAtLaunch: True
+      - Key: RouteTableId
+        Value: !Ref PrivateSubnetRouteTableC
+        PropagateAtLaunch: True
+      - Key: ElasticIp
+        Value: !Ref ElasticIpC
+        PropagateAtLaunch: True
+      - Key: NetworkService
+        Value: "NAT"
+        PropagateAtLaunch: True
+      VPCZoneIdentifier:
+      - !Ref PublicSubnetIdC
